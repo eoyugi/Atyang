@@ -1,0 +1,98 @@
+<form id="registration-form" class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+  <h2 class="text-2xl font-bold">Register & Pay</h2>
+  <p class="mt-2 text-sm text-slate-300">Fill your details to receive an M-PESA payment prompt.</p>
+
+  <div class="mt-5 space-y-4">
+    <label class="block text-sm">
+      <span class="mb-1 block font-medium">Full Name</span>
+      <input
+        required
+        type="text"
+        name="name"
+        class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none ring-emerald-400 focus:ring"
+        placeholder="John Doe"
+      />
+    </label>
+
+    <label class="block text-sm">
+      <span class="mb-1 block font-medium">Email Address</span>
+      <input
+        required
+        type="email"
+        name="email"
+        class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none ring-emerald-400 focus:ring"
+        placeholder="you@example.com"
+      />
+    </label>
+
+    <label class="block text-sm">
+      <span class="mb-1 block font-medium">M-PESA Phone Number</span>
+      <input
+        required
+        type="tel"
+        name="phone"
+        pattern="^(07\\d{8}|2547\\d{8}|01\\d{8}|2541\\d{8})$"
+        class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 outline-none ring-emerald-400 focus:ring"
+        placeholder="07XXXXXXXX or 2547XXXXXXXX"
+      />
+    </label>
+  </div>
+
+  <p id="status-message" class="mt-4 min-h-6 text-sm text-emerald-300" aria-live="polite"></p>
+
+  <button
+    id="submit-button"
+    type="submit"
+    class="mt-4 w-full rounded-lg bg-emerald-500 px-4 py-3 font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+  >
+    Pay & Register
+  </button>
+</form>
+
+<script is:inline>
+  const form = document.getElementById('registration-form');
+  const submitButton = document.getElementById('submit-button');
+  const statusMessage = document.getElementById('status-message');
+
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+
+    if (!(form instanceof HTMLFormElement) || !(submitButton instanceof HTMLButtonElement) || !(statusMessage instanceof HTMLElement)) {
+      return;
+    }
+
+    const formData = new FormData(form);
+    const payload = {
+      name: String(formData.get('name') || ''),
+      email: String(formData.get('email') || ''),
+      phone: String(formData.get('phone') || ''),
+      amount: 500
+    };
+
+    submitButton.disabled = true;
+    statusMessage.textContent = 'Triggering M-PESA prompt on your phone...';
+
+    try {
+      const response = await fetch('/api/stkpush', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result?.error || 'Unable to initiate M-PESA STK Push.');
+      }
+
+      alert('M-PESA prompt dispatched. Please complete payment on your phone.');
+      statusMessage.textContent = 'Prompt sent successfully. Complete payment on your phone.';
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Something went wrong. Please try again.';
+      statusMessage.textContent = message;
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+</script>
