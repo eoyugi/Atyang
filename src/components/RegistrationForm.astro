@@ -81,9 +81,23 @@
         body: JSON.stringify(payload)
       });
 
-      const result = await response.json();
+      const responseText = await response.text();
+      let result = {};
+
+      if (responseText) {
+        try {
+          result = JSON.parse(responseText);
+        } catch {
+          throw new Error('The payment service returned an invalid response. Please try again.');
+        }
+      }
+
       if (!response.ok) {
         throw new Error(result?.error || 'Unable to initiate M-PESA STK Push.');
+      }
+
+      if (result?.ResponseCode !== '0' && result?.ResponseCode !== 0) {
+        throw new Error(result?.CustomerMessage || 'M-PESA did not accept the payment request.');
       }
 
       alert('M-PESA prompt dispatched. Please complete payment on your phone.');

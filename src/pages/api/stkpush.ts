@@ -3,6 +3,26 @@ import type { APIRoute } from 'astro';
 const OAUTH_URL = 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
 const STK_PUSH_URL = 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
+const jsonResponse = (body: Record<string, unknown>, status = 200): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+const readJson = async (response: Response): Promise<Record<string, any>> => {
+  const body = await response.text();
+
+  if (!body) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(body) as Record<string, any>;
+  } catch {
+    return { errorMessage: body.slice(0, 300) };
+  }
+};
+
 const normalizePhoneNumber = (rawPhone: string): string => {
   const digits = rawPhone.replace(/\D/g, '');
 
@@ -46,7 +66,7 @@ const getMpesaAccessToken = async (): Promise<string> => {
     }
   });
 
-  const data = await response.json();
+  const data = await readJson(response);
   if (!response.ok || !data.access_token) {
     throw new Error('Failed to fetch M-PESA access token.');
   }
@@ -64,14 +84,14 @@ export const POST: APIRoute = async ({ request }) => {
     };
 
     if (!name || !email || !phone) {
-      return new Response(JSON.stringify({ error: 'Name, email, and phone are required.' }), { status: 400 });
+      return jsonResponse({ error: 'Name, email, and phone are required.' }, 400);
     }
 
     const normalizedPhone = normalizePhoneNumber(phone);
     const ticketAmount = Number(amount ?? 500);
 
     if (!Number.isFinite(ticketAmount) || ticketAmount <= 0) {
-      return new Response(JSON.stringify({ error: 'Amount must be a valid positive number.' }), { status: 400 });
+      return jsonResponse({ error: 'Amount must be a valid positive number.' }, 400);
     }
 
     const shortcode = import.meta.env.MPESA_SHORTCODE || '174379';
@@ -79,9 +99,16 @@ export const POST: APIRoute = async ({ request }) => {
     const callbackUrl = import.meta.env.MPESA_CALLBACK_URL;
 
     if (!passkey || !callbackUrl) {
-      return new Response(JSON.stringify({ error: 'Missing M-PESA shortcode, passkey, or callback URL.' }), {
-        status: 500
-      });
+      return jsonResponse(
+        { error: 'M-PESA is not configured. Set MPESA_PASSKEY and MPESA_CALLBACK_URL in .env.' },
+        503
+      );
+    }
+
+    try {
+      new URL(callbackUrl);
+    } catch {
+      return jsonResponse({ error: 'MPESA_CALLBACK_URL must be a valid public URL.' }, 503);
     }
 
     const timestamp = getTimestamp();
@@ -110,28 +137,18 @@ export const POST: APIRoute = async ({ request }) => {
       })
     });
 
-    const result = await response.json();
+    const result = await readJson(response);
     if (!response.ok) {
-      return new Response(JSON.stringify({ error: result?.errorMessage || 'STK push request failed.' }), {
-        status: response.status
-      });
+      return jsonResponse({ error: result.errorMessage || 'STK push request failed.' }, response.status);
     }
 
-    return new Response(
-      JSON.stringify({
-        CheckoutRequestID: result.CheckoutRequestID,
-        ResponseCode: result.ResponseCode,
-        CustomerMessage: result.CustomerMessage
-      }),
-      {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+    return jsonResponse({
+      CheckoutRequestID: result.CheckoutRequestID,
+      ResponseCode: result.ResponseCode,
+      CustomerMessage: result.CustomerMessage
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unexpected server error.';
-    return new Response(JSON.stringify({ error: message }), { status: 500 });
+    return jsonResponse({ error: message }, 500);
   }
 };
