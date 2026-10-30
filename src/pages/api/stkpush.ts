@@ -1,12 +1,14 @@
 import type { APIRoute } from 'astro';
+import { createToken, hashTokenValue, sendVerificationEmail } from '../../lib/email';
+import { getDatabasePool } from '../../lib/db';
 
 const OAUTH_URL = 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
 const STK_PUSH_URL = 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
-const jsonResponse = (body: Record<string, unknown>, status = 200): Response =>
+const jsonResponse = (body: Record<string, unknown>, status = 200, headers: HeadersInit = {}): Response =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' }
+    headers: { 'Content-Type': 'application/json', ...headers }
   });
 
 const readJson = async (response: Response): Promise<Record<string, any>> => {
@@ -38,18 +40,27 @@ const normalizePhoneNumber = (rawPhone: string): string => {
 };
 
 const getTimestamp = (): string => {
-  const now = new Date();
-  const parts = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, '0'),
-    String(now.getDate()).padStart(2, '0'),
-    String(now.getHours()).padStart(2, '0'),
-    String(now.getMinutes()).padStart(2, '0'),
-    String(now.getSeconds()).padStart(2, '0')
-  ];
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Africa/Nairobi',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
 
-  return parts.join('');
+  return `${values.year}${values.month}${values.day}${values.hour}${values.minute}${values.second}`;
 };
+
+const getCookieValue = (cookieHeader: string | null, name: string): string | undefined =>
+  cookieHeader
+    ?.split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`))
+    ?.slice(name.length + 1);
 
 const getMpesaAccessToken = async (): Promise<string> => {
   const consumerKey = import.meta.env.MPESA_CONSUMER_KEY;
@@ -111,9 +122,127 @@ export const POST: APIRoute = async ({ request }) => {
       return jsonResponse({ error: 'MPESA_CALLBACK_URL must be a valid public URL.' }, 503);
     }
 
+    const pool = getDatabasePool();
+    const sessionToken = getCookieValue(request.headers.get('cookie'), 'registration_session');
+    let activeRegistrationId: number | undefined;
+
+    if (sessionToken) {
+      const sessionResult = await pool.query<{ id: number; payment_status: string; email_verified_at: Date | null }>(
+        `SELECT id, payment_status, email_verified_at
+         FROM registrations
+         WHERE registration_session_hash = $1
+         LIMIT 1`,
+        [hashTokenValue(sessionToken)]
+      );
+      const sessionRegistration = sessionResult.rows[0];
+
+      if (sessionRegistration) {
+        activeRegistrationId = sessionRegistration.id;
+
+        if (sessionRegistration.payment_status === 'paid') {
+          return jsonResponse({ error: 'This registration has already been paid for.' }, 409);
+        }
+
+        if (!sessionRegistration.email_verified_at) {
+          return jsonResponse({
+            error: 'Check your email and click the verification link before starting payment.',
+            emailVerificationRequired: true
+          }, 202, {
+            'Set-Cookie': `registration_session=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
+          });
+        }
+      }
+    }
+
+    if (activeRegistrationId) {
+      const existingRegistration = await pool.query<{ payment_status: string }>(
+        `SELECT payment_status
+         FROM registrations
+         WHERE id = $1
+         LIMIT 1`,
+        [activeRegistrationId]
+      );
+
+      if (!existingRegistration.rows[0]) {
+        return jsonResponse({ error: 'Registration not found. Please submit the form again.' }, 404);
+      }
+
+      if (existingRegistration.rows[0].payment_status === 'paid') {
+        return jsonResponse({ error: 'This registration has already been paid for.' }, 409);
+      }
+    } else {
+      const session = createToken();
+      try {
+        const registrationResult = await pool.query<{ id: number }>(
+          `INSERT INTO registrations (full_name, email, phone, amount, payment_status, registration_session_hash)
+           VALUES ($1, $2, $3, $4, 'pending', $5)
+           RETURNING id`,
+          [name.trim(), email.trim().toLowerCase(), normalizedPhone, Math.round(ticketAmount), session.tokenHash]
+        );
+        activeRegistrationId = registrationResult.rows[0]?.id;
+
+        const verification = createToken();
+        await pool.query(
+          `UPDATE registrations
+           SET email_verification_token_hash = $1,
+               email_verification_expires_at = NOW() + INTERVAL '15 minutes'
+           WHERE id = $2`,
+          [verification.tokenHash, activeRegistrationId]
+        );
+        await sendVerificationEmail(email.trim().toLowerCase(), name.trim(), verification.token);
+
+        return jsonResponse({
+          emailVerificationRequired: true,
+          message: 'Verification email sent. Click the link in your email, then submit the form again to pay.'
+        }, 202, {
+          'Set-Cookie': `registration_session=${session.token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
+        });
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
+          const existingRegistration = await pool.query<{ id: number; payment_status: string }>(
+            `SELECT id, payment_status
+             FROM registrations
+             WHERE phone = $1
+             LIMIT 1`,
+            [normalizedPhone]
+          );
+          const existing = existingRegistration.rows[0];
+
+          if (!existing) {
+            throw error;
+          }
+
+          if (existing.payment_status === 'paid') {
+            return jsonResponse({ error: 'This phone number is already registered and paid.' }, 409);
+          }
+
+          if (existing.payment_status === 'pending') {
+            return jsonResponse({ error: 'A registration already exists for this phone number. Use the original verification email.' }, 409);
+          }
+
+          activeRegistrationId = existing.id;
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    if (!activeRegistrationId) {
+      throw new Error('Could not create the registration record.');
+    }
+
     const timestamp = getTimestamp();
     const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
     const accessToken = await getMpesaAccessToken();
+
+    const attemptResult = await pool.query<{ id: number }>(
+      `INSERT INTO payment_attempts (registration_id, payer_phone, amount)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [activeRegistrationId, normalizedPhone, Math.round(ticketAmount)]
+    );
+    const attemptId = attemptResult.rows[0]?.id;
+
     const headers: Record<string, string> = {
       'Content-Type': 'application/json'
     };
@@ -139,10 +268,54 @@ export const POST: APIRoute = async ({ request }) => {
 
     const result = await readJson(response);
     if (!response.ok) {
-      return jsonResponse({ error: result.errorMessage || 'STK push request failed.' }, response.status);
+      await pool.query(
+        `UPDATE payment_attempts
+         SET status = 'failed', result_description = $1, updated_at = NOW()
+         WHERE id = $2`,
+        [result.errorMessage || 'STK push request failed.', attemptId]
+      );
+      await pool.query(
+        `UPDATE registrations
+         SET payment_status = 'failed', updated_at = NOW()
+         WHERE id = $1`,
+        [activeRegistrationId]
+      );
+      return jsonResponse({
+        error: result.errorMessage || 'STK push request failed.',
+        registrationId: activeRegistrationId
+      }, response.status);
     }
 
+    if (result.ResponseCode !== '0' && result.ResponseCode !== 0) {
+      const message = result.CustomerMessage || 'M-PESA did not accept the payment request.';
+      await pool.query(
+        `UPDATE payment_attempts
+         SET status = 'failed', result_code = $1, result_description = $2, updated_at = NOW()
+         WHERE id = $3`,
+        [Number(result.ResponseCode), message, attemptId]
+      );
+      await pool.query(
+        `UPDATE registrations SET payment_status = 'failed', updated_at = NOW() WHERE id = $1`,
+        [activeRegistrationId]
+      );
+      return jsonResponse({ error: message, registrationId: activeRegistrationId }, 502);
+    }
+
+    await pool.query(
+      `UPDATE payment_attempts
+       SET checkout_request_id = $1, status = 'pending', updated_at = NOW()
+       WHERE id = $2`,
+      [result.CheckoutRequestID, attemptId]
+    );
+    await pool.query(
+      `UPDATE registrations
+       SET mpesa_checkout_request_id = $1, payment_status = 'pending', updated_at = NOW()
+       WHERE id = $2`,
+      [result.CheckoutRequestID, activeRegistrationId]
+    );
+
     return jsonResponse({
+      registrationId: activeRegistrationId,
       CheckoutRequestID: result.CheckoutRequestID,
       ResponseCode: result.ResponseCode,
       CustomerMessage: result.CustomerMessage

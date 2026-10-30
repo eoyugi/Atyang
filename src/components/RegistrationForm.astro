@@ -1,6 +1,6 @@
 <form id="registration-form" class="rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
-  <h2 class="text-2xl font-bold">Register & Pay</h2>
-  <p class="mt-2 text-sm text-slate-300">Fill your details to receive an M-PESA payment prompt.</p>
+  <h2 class="text-2xl font-bold text-white">Reserve your seat</h2>
+  <p class="mt-2 text-sm text-slate-300">Enter your details and pay the KES 500 registration fee via M-PESA.</p>
 
   <div class="mt-5 space-y-4">
     <label class="block text-sm">
@@ -26,7 +26,7 @@
     </label>
 
     <label class="block text-sm">
-      <span class="mb-1 block font-medium">M-PESA Phone Number</span>
+      <span class="mb-1 block font-medium">M-PESA payment number</span>
       <input
         required
         type="tel"
@@ -45,7 +45,7 @@
     type="submit"
     class="mt-4 w-full rounded-lg bg-emerald-500 px-4 py-3 font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
   >
-    Pay & Register
+    Pay KES 500 & Register
   </button>
 </form>
 
@@ -53,6 +53,10 @@
   const form = document.getElementById('registration-form');
   const submitButton = document.getElementById('submit-button');
   const statusMessage = document.getElementById('status-message');
+
+  if (new URLSearchParams(window.location.search).get('verified') === '1' && statusMessage instanceof HTMLElement) {
+    statusMessage.textContent = 'Email verified. Submit the form again to start your M-PESA payment.';
+  }
 
   form?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -70,7 +74,7 @@
     };
 
     submitButton.disabled = true;
-    statusMessage.textContent = 'Triggering M-PESA prompt on your phone...';
+    statusMessage.textContent = 'Checking your registration...';
 
     try {
       const response = await fetch('/api/stkpush', {
@@ -92,6 +96,12 @@
         }
       }
 
+      if (result?.emailVerificationRequired) {
+        statusMessage.textContent = result?.message || result?.error || 'Check your email to verify your registration before paying.';
+        submitButton.textContent = 'I Have Verified My Email';
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(result?.error || 'Unable to initiate M-PESA STK Push.');
       }
@@ -100,11 +110,52 @@
         throw new Error(result?.CustomerMessage || 'M-PESA did not accept the payment request.');
       }
 
-      alert('M-PESA prompt dispatched. Please complete payment on your phone.');
-      statusMessage.textContent = 'Prompt sent successfully. Complete payment on your phone.';
+      const checkoutRequestId = result?.CheckoutRequestID;
+
+      if (!checkoutRequestId) {
+        throw new Error('M-PESA did not return a checkout request ID.');
+      }
+
+      statusMessage.textContent = 'Prompt sent. Enter your PIN on your phone to complete payment.';
+
+      const maxAttempts = 40;
+      let paymentStatus = 'pending';
+
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 3000));
+
+        const statusResponse = await fetch(
+          `/api/payment-status?checkoutRequestId=${encodeURIComponent(checkoutRequestId)}`
+        );
+        const statusResult = await statusResponse.json();
+
+        if (!statusResponse.ok) {
+          throw new Error(statusResult?.error || 'Unable to check payment status.');
+        }
+
+        paymentStatus = statusResult?.status || 'pending';
+
+        if (paymentStatus === 'paid') {
+          statusMessage.textContent = 'Payment received. Your registration is confirmed.';
+          submitButton.textContent = 'Pay KES 500 & Register';
+          form.reset();
+          break;
+        }
+
+        if (paymentStatus === 'failed') {
+          throw new Error(statusResult?.message || 'Payment was cancelled or declined.');
+        }
+
+        statusMessage.textContent = 'Waiting for M-PESA confirmation...';
+      }
+
+      if (paymentStatus === 'pending') {
+        throw new Error('Payment confirmation timed out. Check your M-PESA messages and try again.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Something went wrong. Please try again.';
       statusMessage.textContent = message;
+      submitButton.textContent = 'Try Again';
     } finally {
       submitButton.disabled = false;
     }
