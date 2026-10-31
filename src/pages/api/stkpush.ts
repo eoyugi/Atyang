@@ -4,6 +4,7 @@ import { getDatabasePool } from '../../lib/db';
 
 const OAUTH_URL = 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
 const STK_PUSH_URL = 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
+const skipEmailVerification = import.meta.env.DEV && import.meta.env.SKIP_EMAIL_VERIFICATION === 'true';
 
 const jsonResponse = (body: Record<string, unknown>, status = 200, headers: HeadersInit = {}): Response =>
   new Response(JSON.stringify(body), {
@@ -143,7 +144,7 @@ export const POST: APIRoute = async ({ request }) => {
           return jsonResponse({ error: 'This registration has already been paid for.' }, 409);
         }
 
-        if (!sessionRegistration.email_verified_at) {
+        if (!sessionRegistration.email_verified_at && !skipEmailVerification) {
           return jsonResponse({
             error: 'Check your email and click the verification link before starting payment.',
             emailVerificationRequired: true
@@ -181,22 +182,32 @@ export const POST: APIRoute = async ({ request }) => {
         );
         activeRegistrationId = registrationResult.rows[0]?.id;
 
-        const verification = createToken();
-        await pool.query(
-          `UPDATE registrations
-           SET email_verification_token_hash = $1,
-               email_verification_expires_at = NOW() + INTERVAL '15 minutes'
-           WHERE id = $2`,
-          [verification.tokenHash, activeRegistrationId]
-        );
-        await sendVerificationEmail(email.trim().toLowerCase(), name.trim(), verification.token);
+        if (skipEmailVerification) {
+          await pool.query(
+            `UPDATE registrations
+             SET email_verified_at = NOW()
+             WHERE id = $1`,
+            [activeRegistrationId]
+          );
+        } else {
+          const verification = createToken();
+          await pool.query(
+            `UPDATE registrations
+             SET email_verification_token_hash = $1,
+                 email_verification_expires_at = NOW() + INTERVAL '15 minutes'
+             WHERE id = $2`,
+            [verification.tokenHash, activeRegistrationId]
+          );
+          await sendVerificationEmail(email.trim().toLowerCase(), name.trim(), verification.token);
 
-        return jsonResponse({
-          emailVerificationRequired: true,
-          message: 'Verification email sent. Click the link in your email, then submit the form again to pay.'
-        }, 202, {
-          'Set-Cookie': `registration_session=${session.token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
-        });
+          return jsonResponse({
+            emailVerificationRequired: true,
+            message: 'Verification email sent. Click the link in your email, then submit the form again to pay.'
+          }, 202, {
+            'Set-Cookie': `registration_session=${session.token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400`
+          });
+        }
+
       } catch (error) {
         if (error && typeof error === 'object' && 'code' in error && error.code === '23505') {
           const existingRegistration = await pool.query<{ id: number; payment_status: string }>(
@@ -217,7 +228,16 @@ export const POST: APIRoute = async ({ request }) => {
           }
 
           if (existing.payment_status === 'pending') {
-            return jsonResponse({ error: 'A registration already exists for this phone number. Use the original verification email.' }, 409);
+            if (!skipEmailVerification) {
+              return jsonResponse({ error: 'A registration already exists for this phone number. Use the original verification email.' }, 409);
+            }
+
+            await pool.query(
+              `UPDATE registrations
+               SET email_verified_at = NOW()
+               WHERE id = $1`,
+              [existing.id]
+            );
           }
 
           activeRegistrationId = existing.id;
